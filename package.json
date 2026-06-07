@@ -1,0 +1,60 @@
+{
+  "name": "opencode-grok-auth",
+  "version": "0.1.0",
+  "description": "OpenCode plugin for Grok OAuth using the SuperGrok PKCE flow.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ysnock404/opencode-grok-auth.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ysnock404/opencode-grok-auth/issues"
+  },
+  "homepage": "https://github.com/ysnock404/opencode-grok-auth#readme",
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "keywords": [
+    "opencode",
+    "xai",
+    "grok",
+    "oauth",
+    "pkce",
+    "plugin",
+    "supergrok"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "packageManager": "bun@1.3.13",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "import:hermes": "node scripts/import-hermes-xai.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^0.15.30",
+    "@types/node": "^24.10.1",
+    "typescript": "^5.0.0",
+    "vitest": "^3.0.0"
+  }
+}
