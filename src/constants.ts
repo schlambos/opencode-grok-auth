@@ -17,6 +17,27 @@ export const XAI_OAUTH_REDIRECT_PATH = "/callback";
 export const XAI_ACCESS_TOKEN_REFRESH_SKEW_MS = 120_000;
 export const OAUTH_CALLBACK_TIMEOUT_MS = 180_000;
 
+// --- Model-list dynamic discovery ---
+// Public xAI API exposes models at /language-models; the Grok Build proxy
+// exposes an OpenAI-compatible /models endpoint.
+export const XAI_LANGUAGE_MODELS_PATH = "/language-models";
+export const OPENAI_MODELS_PATH = "/models";
+
+// Env var that lets users opt out of dynamic model-list fetching.
+export const XAI_DYNAMIC_MODELS_ENV = "OPENCODE_XAI_DYNAMIC_MODELS";
+
+// On-disk cache for the most recent successful model-list fetch, written next
+// to the OpenCode auth.json so the loader can survive a temporary network
+// failure on next startup.
+export const XAI_MODELS_CACHE_FILE = "xai-grok-models-cache.json";
+export const XAI_MODELS_CACHE_VERSION = 1;
+export const XAI_MODELS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+export const XAI_MODELS_FETCH_TIMEOUT_MS = 3000;
+
+// Sensible defaults used when the upstream model list omits window/output info.
+export const DEFAULT_CONTEXT_WINDOW_TOKENS = 131_072;
+export const DEFAULT_OUTPUT_TOKENS = 8192;
+
 export const DEFAULT_XAI_MODELS = [
   "grok-4.3",
   "grok-4.20-0309-reasoning",
@@ -46,4 +67,16 @@ export const SAFE_XAI_API_HOSTS = ["api.x.ai", "cli-chat-proxy.grok.com"] as con
 // `a["xai-oauth"] ?? a.xai`). Lets Composer work without a second login.
 export const SHARED_OAUTH_AUTH_KEYS = ["xai-oauth", "xai"] as const;
 
-export const DEFAULT_COMPOSER_MODELS = ["grok-composer-2.5-fast"] as const;
+// Prefixes whose models are filtered out of the dynamic list — they are
+// non-text endpoints (image/video/audio generation, etc.) and should not be
+// surfaced as chat models in OpenCode.
+export const MEDIA_MODEL_DENYLIST_PREFIXES = [
+  "grok-imagine",
+  "grok-image",
+  "grok-video",
+  "grok-voice",
+  "grok-audio",
+  "grok-tts",
+] as const;
+
+export const DEFAULT_COMPOSER_MODELS = ["grok-composer-2.5-fast", "grok-build"] as const;

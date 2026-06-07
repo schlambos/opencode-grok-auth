@@ -1,8 +1,10 @@
 export {
   XaiGrokOAuthPlugin,
   XaiComposerOAuthPlugin,
+  applyDefaultProviderConfig,
   createXaiGrokOAuthPlugin,
   createXaiComposerOAuthPlugin,
+  isSafeXaiApiUrl,
   default,
 } from "./src/plugin.js";
 

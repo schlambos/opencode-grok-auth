@@ -8,15 +8,25 @@ import {
   COMPOSER_PROVIDER_ID,
   COMPOSER_PROVIDER_NAME,
   DEFAULT_COMPOSER_MODELS,
+  DEFAULT_CONTEXT_WINDOW_TOKENS,
+  DEFAULT_OUTPUT_TOKENS,
   DEFAULT_XAI_MODELS,
   GROK_CLIENT_IDENTIFIER,
   GROK_CLIENT_VERSION,
+  MEDIA_MODEL_DENYLIST_PREFIXES,
   OAUTH_CALLBACK_TIMEOUT_MS,
+  OPENAI_MODELS_PATH,
   PROVIDER_ID,
   PROVIDER_NAME,
   SAFE_XAI_API_HOSTS,
   SHARED_OAUTH_AUTH_KEYS,
   XAI_API_BASE_URL,
+  XAI_DYNAMIC_MODELS_ENV,
+  XAI_LANGUAGE_MODELS_PATH,
+  XAI_MODELS_CACHE_FILE,
+  XAI_MODELS_CACHE_TTL_MS,
+  XAI_MODELS_CACHE_VERSION,
+  XAI_MODELS_FETCH_TIMEOUT_MS,
 } from "./constants.js";
 import { accessTokenExpired, isOAuthAuth, packXaiRefresh, parseXaiRefresh } from "./auth.js";
 import {
@@ -33,11 +43,16 @@ import {
 import { startXaiOAuthListener } from "./server.js";
 import type {
   AuthDetails,
+  DynamicModelConfig,
   GetAuth,
   LoaderResult,
+  ModelCacheEntry,
+  ModelCacheFile,
+  ModelListItem,
   OAuthAuthDetails,
   PluginClient,
   Provider,
+  ProviderModel,
   XaiGrokPluginOptions,
   XaiTokenExchangeResult,
 } from "./types.js";
@@ -45,6 +60,22 @@ import type {
 type StoredOAuthAuthDetails = OAuthAuthDetails & {
   access: string;
   expires: number;
+};
+
+type ConfigHookDefaultsInput = {
+  client: PluginClient | undefined;
+  providerId: string;
+  baseURL: string;
+  staticModels: readonly string[];
+  dynamicModels: boolean;
+  modelListPath: string;
+  modelListKind: "xai-language-models" | "openai-models";
+  alwaysIncludeModels: readonly string[];
+  modelCacheTtlMs: number;
+  modelFetchTimeoutMs: number;
+  modelAuthKeys: readonly string[];
+  injectGrokClientHeaders: boolean;
+  config: unknown;
 };
 
 export function createXaiGrokOAuthPlugin(
@@ -57,15 +88,55 @@ export function createXaiGrokOAuthPlugin(
   const injectModelOverride = options.injectModelOverride ?? false;
   const importTokenFrom = options.importTokenFrom ?? [];
 
+  // Two-provider design:
+  //   - Public xAI API (api.x.ai):     /language-models, no override
+  //   - Grok Build proxy (composer):    /models, override
+  const dynamicModels = options.dynamicModels ?? true;
+  const modelListPath =
+    options.modelListPath ??
+    (baseURL === CLI_CHAT_PROXY_BASE_URL ? OPENAI_MODELS_PATH : XAI_LANGUAGE_MODELS_PATH);
+  const modelListKind =
+    options.modelListKind ??
+    (baseURL === CLI_CHAT_PROXY_BASE_URL ? "openai-models" : "xai-language-models");
+  const alwaysIncludeModels = options.alwaysIncludeModels ?? [];
+  const modelCacheTtlMs = options.modelCacheTtlMs ?? XAI_MODELS_CACHE_TTL_MS;
+  const modelFetchTimeoutMs = options.modelFetchTimeoutMs ?? XAI_MODELS_FETCH_TIMEOUT_MS;
+  const modelAuthKeys = dedupe([
+    ...(options.modelAuthKeys ?? []),
+    providerId,
+    ...importTokenFrom,
+    ...SHARED_OAUTH_AUTH_KEYS,
+  ]);
+
   const plugin: Plugin = async ({ client }) => {
     return {
       config: async (config) => {
-        applyDefaultProviderConfig(config, providerId, { baseURL, providerName, models });
-        // Seed a dedicated provider (e.g. xai-composer) with an existing Grok
-        // OAuth token so it works without a second login.
+        if (!shouldAutoConfigure()) {
+          return;
+        }
         if (importTokenFrom.length) {
           await seedSharedAuth(client, providerId, importTokenFrom);
         }
+        const modelDefaults = await resolveModelDefaultsForConfig({
+          client,
+          providerId,
+          baseURL,
+          staticModels: models,
+          dynamicModels,
+          modelListPath,
+          modelListKind,
+          alwaysIncludeModels,
+          modelCacheTtlMs,
+          modelFetchTimeoutMs,
+          modelAuthKeys,
+          injectGrokClientHeaders: injectModelOverride,
+          config,
+        });
+        applyDefaultProviderConfig(config, providerId, {
+          baseURL,
+          providerName,
+          models: modelDefaults,
+        });
       },
       auth: {
         provider: providerId,
@@ -92,14 +163,20 @@ export function createXaiGrokOAuthPlugin(
 
               const modelOverride = injectModelOverride ? extractModelId(init) : undefined;
               const freshAuth = await ensureFreshAuth(latest, client, providerId);
-              const request = buildBearerRequest(input, init, freshAuth.access ?? "", { modelOverride });
+              const request = buildBearerRequest(input, init, freshAuth.access ?? "", {
+                modelOverride,
+                includeGrokClientHeaders: injectModelOverride,
+              });
               const retrySeed = request.clone();
               let response = await fetch(request);
 
               if (response.status === 401) {
                 const refreshed = await refreshStoredAuth(freshAuth, client, providerId);
                 response = await fetch(
-                  buildBearerRequest(retrySeed, undefined, refreshed.access, { modelOverride }),
+                  buildBearerRequest(retrySeed, undefined, refreshed.access, {
+                    modelOverride,
+                    includeGrokClientHeaders: injectModelOverride,
+                  }),
                 );
               }
 
@@ -209,6 +286,9 @@ export function createXaiComposerOAuthPlugin(providerId = COMPOSER_PROVIDER_ID):
     models: DEFAULT_COMPOSER_MODELS,
     injectModelOverride: true,
     importTokenFrom: SHARED_OAUTH_AUTH_KEYS,
+    modelListPath: OPENAI_MODELS_PATH,
+    modelListKind: "openai-models",
+    alwaysIncludeModels: DEFAULT_COMPOSER_MODELS,
   });
 }
 
@@ -217,7 +297,11 @@ export const XaiComposerOAuthPlugin = createXaiComposerOAuthPlugin();
 export function applyDefaultProviderConfig(
   config: unknown,
   providerId = PROVIDER_ID,
-  opts: { baseURL?: string; providerName?: string; models?: readonly string[] } = {},
+  opts: {
+    baseURL?: string;
+    providerName?: string;
+    models?: readonly (string | DynamicModelConfig)[];
+  } = {},
 ): void {
   if (process.env.OPENCODE_XAI_OAUTH_AUTO_CONFIG === "false") {
     return;
@@ -237,10 +321,12 @@ export function applyDefaultProviderConfig(
   options.baseURL ??= opts.baseURL ?? XAI_API_BASE_URL;
 
   const models = getOrCreateRecord(provider, "models");
-  for (const model of opts.models ?? DEFAULT_XAI_MODELS) {
-    const existing = models[model];
+  for (const entry of opts.models ?? DEFAULT_XAI_MODELS) {
+    const id = typeof entry === "string" ? entry : entry.id;
+    const value: ProviderModel = typeof entry === "string" ? { name: entry } : entry.model;
+    const existing = models[id];
     if (!existing || typeof existing !== "object") {
-      models[model] = { name: model };
+      models[id] = value;
     }
   }
 }
@@ -256,11 +342,10 @@ async function ensureFreshAuth(
   return refreshStoredAuth(auth, client, providerId);
 }
 
-async function refreshStoredAuth(
-  auth: OAuthAuthDetails,
-  client: PluginClient | undefined,
-  providerId: string,
-): Promise<StoredOAuthAuthDetails> {
+/** Reusable token-endpoint refresh: parses the packed refresh, calls the
+ *  OAuth token endpoint, and returns the new stored auth details. Does NOT
+ *  persist the new credentials. */
+async function refreshOAuthAuth(auth: OAuthAuthDetails): Promise<StoredOAuthAuthDetails> {
   const parts = parseXaiRefresh(auth.refresh);
   if (!parts.refreshToken) {
     throw new Error("xAI OAuth refresh token is missing. Run `opencode auth login` again.");
@@ -272,7 +357,7 @@ async function refreshStoredAuth(
     refreshToken: parts.refreshToken,
   });
 
-  const nextAuth: StoredOAuthAuthDetails = {
+  return {
     type: "oauth",
     refresh: packXaiRefresh({
       refreshToken: refreshed.refreshToken,
@@ -282,19 +367,15 @@ async function refreshStoredAuth(
     access: refreshed.accessToken,
     expires: refreshed.expiresAt,
   };
+}
 
-  if (client) {
-    await client.auth.set({
-      path: { id: providerId },
-      body: {
-        type: "oauth",
-        refresh: nextAuth.refresh,
-        access: nextAuth.access,
-        expires: nextAuth.expires,
-      },
-    });
-  }
-
+async function refreshStoredAuth(
+  auth: OAuthAuthDetails,
+  client: PluginClient | undefined,
+  providerId: string,
+): Promise<StoredOAuthAuthDetails> {
+  const nextAuth = await refreshOAuthAuth(auth);
+  await persistAuth(client, providerId, nextAuth).catch(() => undefined);
   return nextAuth;
 }
 
@@ -302,7 +383,7 @@ function buildBearerRequest(
   input: RequestInfo | URL,
   init: RequestInit | undefined,
   accessToken: string,
-  opts: { modelOverride?: string } = {},
+  opts: { modelOverride?: string; includeGrokClientHeaders?: boolean } = {},
 ): Request {
   if (!accessToken) {
     throw new Error("xAI OAuth access token is missing. Run `opencode auth login` again.");
@@ -322,9 +403,13 @@ function buildBearerRequest(
     headers.set("x-grok-source", "opencode-grok-auth");
   }
 
-  // Route to the correct inference cluster on the Grok Build proxy (Composer).
-  if (opts.modelOverride) {
-    headers.set("x-grok-model-override", opts.modelOverride);
+  // Inject Grok client headers whenever we are routing through the Build
+  // proxy (composer model-list fetch) or per-request routing a Composer
+  // chat request via x-grok-model-override.
+  if (opts.modelOverride || opts.includeGrokClientHeaders) {
+    if (opts.modelOverride) {
+      headers.set("x-grok-model-override", opts.modelOverride);
+    }
     if (!headers.has("x-grok-client-version")) {
       headers.set("x-grok-client-version", GROK_CLIENT_VERSION);
     }
@@ -471,6 +556,451 @@ function getOrCreateRecord(parent: Record<string, unknown>, key: string): Record
   const next: Record<string, unknown> = {};
   parent[key] = next;
   return next;
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic model-list resolution
+// ---------------------------------------------------------------------------
+
+/** True when the user has not opted out of the plugin's auto-config. */
+function shouldAutoConfigure(): boolean {
+  return process.env.OPENCODE_XAI_OAUTH_AUTO_CONFIG !== "false";
+}
+
+/** True when the dynamic model-list fetch is enabled. */
+function dynamicModelsEnabled(): boolean {
+  return process.env[XAI_DYNAMIC_MODELS_ENV] !== "false";
+}
+
+/**
+ * If the user already set `provider[providerId].options.baseURL` in their
+ * config and it differs from the base URL this instance is using, skip
+ * the dynamic fetch — we cannot assume the user's override is on the same
+ * backend as ours.
+ */
+function isProviderBaseUrlCompatible(
+  config: unknown,
+  providerId: string,
+  baseURL: string,
+): boolean {
+  if (!config || typeof config !== "object") {
+    return true;
+  }
+  const root = config as Record<string, unknown>;
+  const provider = (root.provider ?? undefined) as Record<string, unknown> | undefined;
+  if (!provider) {
+    return true;
+  }
+  const entry = provider[providerId];
+  if (!entry || typeof entry !== "object") {
+    return true;
+  }
+  const options = (entry as Record<string, unknown>).options;
+  if (!options || typeof options !== "object") {
+    return true;
+  }
+  const userBaseURL = (options as Record<string, unknown>).baseURL;
+  if (typeof userBaseURL !== "string" || userBaseURL.length === 0) {
+    return true;
+  }
+  return userBaseURL === baseURL;
+}
+
+/** Resolve a valid OAuth credential for the dynamic model-list fetch. */
+async function resolveConfigOAuthAuth(input: {
+  client: PluginClient | undefined;
+  providerId: string;
+  authKeys: readonly string[];
+}): Promise<StoredOAuthAuthDetails | undefined> {
+  const store = readAuthStore();
+  if (!store) {
+    return undefined;
+  }
+  const auth = pickSharedOAuth(store, input.authKeys);
+  if (!auth) {
+    return undefined;
+  }
+  if (!accessTokenExpired(auth)) {
+    return auth;
+  }
+  const refreshed = await refreshOAuthAuth(auth).catch(() => undefined);
+  if (!refreshed) {
+    return undefined;
+  }
+  await persistAuth(input.client, input.providerId, refreshed).catch(() => undefined);
+  return refreshed;
+}
+
+async function resolveModelDefaultsForConfig(
+  input: ConfigHookDefaultsInput,
+): Promise<readonly (string | DynamicModelConfig)[]> {
+  const staticDefaults: DynamicModelConfig[] = input.staticModels.map((id) => ({
+    id,
+    model: { name: id },
+  }));
+
+  if (!dynamicModelsEnabled()) {
+    return input.staticModels;
+  }
+  if (!input.dynamicModels) {
+    return input.staticModels;
+  }
+  if (!isProviderBaseUrlCompatible(input.config, input.providerId, input.baseURL)) {
+    return input.staticModels;
+  }
+
+  const cache = readModelCache(input.providerId, input.baseURL, input.modelListPath);
+  if (cache && isModelCacheFresh(cache, input.modelCacheTtlMs)) {
+    return unionAlwaysInclude(cache.models, input.alwaysIncludeModels);
+  }
+
+  const auth = await resolveConfigOAuthAuth({
+    client: input.client,
+    providerId: input.providerId,
+    authKeys: input.modelAuthKeys,
+  });
+  if (!auth) {
+    return cache?.models ?? staticDefaults;
+  }
+
+  try {
+    // resolveConfigOAuthAuth already returns a non-expired auth (refreshing
+    // if needed), so the call below is a defensive re-check.
+    const freshAuth = await ensureFreshAuth(auth, input.client, input.providerId);
+    const fetched = await fetchDynamicModels({
+      baseURL: input.baseURL,
+      endpointPath: input.modelListPath,
+      kind: input.modelListKind,
+      auth: freshAuth,
+      timeoutMs: input.modelFetchTimeoutMs,
+      includeGrokClientHeaders: input.injectGrokClientHeaders,
+    });
+    const merged = unionAlwaysInclude(fetched, input.alwaysIncludeModels);
+    if (merged.length === 0) {
+      throw new Error("Dynamic model list was empty after filtering.");
+    }
+    writeModelCache(input.providerId, input.baseURL, input.modelListPath, merged);
+    return merged;
+  } catch {
+    return cache?.models ?? staticDefaults;
+  }
+}
+
+function fetchDynamicModels(input: {
+  baseURL: string;
+  endpointPath: string;
+  kind: "xai-language-models" | "openai-models";
+  auth: OAuthAuthDetails;
+  timeoutMs: number;
+  includeGrokClientHeaders: boolean;
+}): Promise<DynamicModelConfig[]> {
+  // String-concat join (NOT `new URL(endpointPath, baseURL)`): because
+  // endpointPath starts with `/` (e.g. `/language-models` or `/models`), the
+  // URL constructor resolves it against the host ROOT and silently drops the
+  // baseURL's `/v1` segment — yielding 404s on every live model-list fetch.
+  // See issue: "dynamic model-list fetch 404s" — public xai-oauth never
+  // captured `grok-build-0.1` and Composer was masking the same defect via
+  // its static fallback.
+  const url = input.baseURL.replace(/\/+$/, "") + input.endpointPath;
+  return withTimeout(input.timeoutMs, async (signal) => {
+    const request = buildBearerRequest(
+      url,
+      {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        signal,
+      },
+      input.auth.access ?? "",
+      { includeGrokClientHeaders: input.includeGrokClientHeaders },
+    );
+    const initial = await fetch(request);
+    if (initial.status !== 401) {
+      return mapDynamicResponse(initial, input.kind);
+    }
+    // 401 → refresh once and retry.
+    const refreshed = await refreshOAuthAuth(input.auth);
+    const retry = buildBearerRequest(
+      url,
+      {
+        method: "GET",
+        headers: { Accept: "application/json" },
+        signal,
+      },
+      refreshed.access,
+      { includeGrokClientHeaders: input.includeGrokClientHeaders },
+    );
+    const retryResponse = await fetch(retry);
+    return mapDynamicResponse(retryResponse, input.kind);
+  });
+}
+
+async function mapDynamicResponse(
+  response: Response,
+  _kind: "xai-language-models" | "openai-models",
+): Promise<DynamicModelConfig[]> {
+  if (!response.ok) {
+    throw new Error(`Dynamic model list fetch failed with HTTP ${response.status}.`);
+  }
+  const text = await response.text();
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text);
+  } catch {
+    throw new Error("Dynamic model list response was not valid JSON.");
+  }
+  const items = extractModelListItems(payload);
+  return items
+    .filter((item) => isChatModelItem(item))
+    .map((item) => buildModelConfig(item));
+}
+
+function extractModelListItems(payload: unknown): ModelListItem[] {
+  if (Array.isArray(payload)) {
+    return payload.filter(isModelListItem) as ModelListItem[];
+  }
+  if (payload && typeof payload === "object") {
+    const obj = payload as Record<string, unknown>;
+    for (const key of ["data", "models"]) {
+      const value = obj[key];
+      if (Array.isArray(value)) {
+        return value.filter(isModelListItem) as ModelListItem[];
+      }
+    }
+  }
+  return [];
+}
+
+function isModelListItem(value: unknown): value is ModelListItem {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const id = (value as { id?: unknown }).id;
+  return typeof id === "string" && id.length > 0;
+}
+
+/** Only keep chat/text endpoints. The media-denylist prefixes are excluded. */
+function isChatModelItem(item: ModelListItem): boolean {
+  const id = typeof item.id === "string" ? item.id : "";
+  if (!id.startsWith("grok-")) {
+    return false;
+  }
+  for (const prefix of MEDIA_MODEL_DENYLIST_PREFIXES) {
+    if (id.startsWith(prefix)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function buildModelConfig(item: ModelListItem): DynamicModelConfig {
+  const rawId = typeof item.id === "string" ? item.id : "";
+  const id = rawId.trim();
+  const nameFromItem = typeof item.name === "string" ? item.name.trim() : "";
+  const name = nameFromItem || prettifyModelId(id) || id;
+  return {
+    id,
+    model: {
+      name,
+      cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+      limit: {
+        context: pickNumericContext(item) ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
+        output: pickNumericOutput(item) ?? DEFAULT_OUTPUT_TOKENS,
+      },
+    },
+  };
+}
+
+function pickNumericContext(item: ModelListItem): number | undefined {
+  for (const key of ["context_window", "contextWindow", "max_context_window"] as const) {
+    const value = item[key];
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+function pickNumericOutput(item: ModelListItem): number | undefined {
+  for (const key of ["max_output_tokens", "output_token_limit"] as const) {
+    const value = item[key];
+    if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+/** "grok-4.3" → "Grok 4.3"; "grok-build-0.1" → "Grok Build 0.1";
+ *  "grok-composer-2.5-fast" → "Grok Composer 2.5 Fast". */
+function prettifyModelId(id: string): string {
+  if (!id) {
+    return "";
+  }
+  const tokens = id.split("-").filter(Boolean);
+  if (tokens[0]?.toLowerCase() === "grok") {
+    tokens.shift();
+  }
+  return tokens
+    .map((token) => (/[0-9]/.test(token) ? token : titleCase(token)))
+    .join(" ")
+    .trim();
+}
+
+function titleCase(token: string): string {
+  if (!token) {
+    return token;
+  }
+  return token.charAt(0).toUpperCase() + token.slice(1);
+}
+
+function unionAlwaysInclude(
+  fetched: DynamicModelConfig[],
+  alwaysInclude: readonly string[],
+): DynamicModelConfig[] {
+  if (alwaysInclude.length === 0) {
+    return fetched;
+  }
+  const seen = new Set(fetched.map((m) => m.id));
+  const out: DynamicModelConfig[] = [...fetched];
+  for (const id of alwaysInclude) {
+    if (!id || seen.has(id)) {
+      continue;
+    }
+    seen.add(id);
+    out.push({ id, model: { name: prettifyModelId(id) || id } });
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// On-disk model cache
+// ---------------------------------------------------------------------------
+
+function modelCachePath(): string {
+  return path.join(path.dirname(authStorePath()), XAI_MODELS_CACHE_FILE);
+}
+
+function readModelCache(
+  providerId: string,
+  baseURL: string,
+  endpointPath: string,
+): ModelCacheEntry | undefined {
+  try {
+    const file = modelCachePath();
+    if (!fs.existsSync(file)) {
+      return undefined;
+    }
+    const raw = fs.readFileSync(file, "utf8");
+    const parsed = JSON.parse(raw) as Partial<ModelCacheFile> | null;
+    if (!parsed || typeof parsed !== "object") {
+      return undefined;
+    }
+    if (parsed.version !== XAI_MODELS_CACHE_VERSION) {
+      return undefined;
+    }
+    const providers = parsed.providers;
+    if (!providers || typeof providers !== "object") {
+      return undefined;
+    }
+    const entry = (providers as Record<string, ModelCacheEntry | undefined>)[providerId];
+    if (!entry) {
+      return undefined;
+    }
+    if (entry.baseURL !== baseURL) {
+      return undefined;
+    }
+    if (entry.endpointPath !== endpointPath) {
+      return undefined;
+    }
+    if (typeof entry.fetchedAt !== "number" || !Number.isFinite(entry.fetchedAt)) {
+      return undefined;
+    }
+    if (!Array.isArray(entry.models) || entry.models.length === 0) {
+      return undefined;
+    }
+    if (!entry.models.every(isWellFormedDynamicModelConfig)) {
+      return undefined;
+    }
+    return entry;
+  } catch {
+    return undefined;
+  }
+}
+
+function isWellFormedDynamicModelConfig(value: unknown): value is DynamicModelConfig {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const entry = value as { id?: unknown; model?: unknown };
+  if (typeof entry.id !== "string" || entry.id.length === 0) {
+    return false;
+  }
+  return !!entry.model && typeof entry.model === "object";
+}
+
+function isModelCacheFresh(entry: ModelCacheEntry, ttlMs: number): boolean {
+  return Date.now() - entry.fetchedAt < ttlMs;
+}
+
+function writeModelCache(
+  providerId: string,
+  baseURL: string,
+  endpointPath: string,
+  models: DynamicModelConfig[],
+): void {
+  try {
+    const file = modelCachePath();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    let next: ModelCacheFile = { version: XAI_MODELS_CACHE_VERSION, providers: {} };
+    if (fs.existsSync(file)) {
+      try {
+        const existing = JSON.parse(fs.readFileSync(file, "utf8")) as ModelCacheFile;
+        if (
+          existing &&
+          typeof existing === "object" &&
+          existing.version === XAI_MODELS_CACHE_VERSION &&
+          existing.providers &&
+          typeof existing.providers === "object"
+        ) {
+          next = existing;
+        }
+      } catch {
+        // Corrupt file: start fresh.
+      }
+    }
+    next.providers[providerId] = {
+      baseURL,
+      endpointPath,
+      fetchedAt: Date.now(),
+      models,
+    };
+    const tempFile = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(next, null, 2), "utf8");
+    fs.renameSync(tempFile, file);
+  } catch {
+    // best-effort: never break startup
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Misc helpers
+// ---------------------------------------------------------------------------
+
+function dedupe<T>(values: readonly T[]): T[] {
+  return Array.from(new Set(values));
+}
+
+async function withTimeout<T>(
+  timeoutMs: number,
+  fn: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(1, timeoutMs));
+  try {
+    return await fn(controller.signal);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function shouldOpenBrowser(): boolean {

@@ -1,5 +1,5 @@
 import type { Plugin } from "@opencode-ai/plugin";
-import type { XaiGrokPluginOptions } from "./types.js";
+import type { DynamicModelConfig, XaiGrokPluginOptions } from "./types.js";
 export declare function createXaiGrokOAuthPlugin(providerId?: string, options?: XaiGrokPluginOptions): Plugin;
 export declare const XaiGrokOAuthPlugin: Plugin;
 export default XaiGrokOAuthPlugin;
@@ -14,6 +14,6 @@ export declare const XaiComposerOAuthPlugin: Plugin;
 export declare function applyDefaultProviderConfig(config: unknown, providerId?: string, opts?: {
     baseURL?: string;
     providerName?: string;
-    models?: readonly string[];
+    models?: readonly (string | DynamicModelConfig)[];
 }): void;
 export declare function isSafeXaiApiUrl(url: URL): boolean;
