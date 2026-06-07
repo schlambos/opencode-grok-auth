@@ -7,6 +7,11 @@ This is the xAI equivalent of the Antigravity OAuth plugin pattern: OpenCode
 gets a provider, model definitions, an OAuth login method, automatic token
 refresh, and a fetch layer that sends requests to `https://api.x.ai/v1`.
 
+It also exposes **Cursor Composer 2.5** (`grok-composer-2.5-fast`) and the
+agentic **`grok-build`** model through a second provider, `xai-composer`, which
+talks to the Grok Build backend (`https://cli-chat-proxy.grok.com/v1`). See
+[Composer 2.5 (Grok Build)](#composer-25-grok-build) below.
+
 ## What You Get
 
 - OAuth login for `xai-oauth` inside `opencode auth login`.
@@ -17,7 +22,8 @@ refresh, and a fetch layer that sends requests to `https://api.x.ai/v1`.
 - Hermes-compatible token exchange, including `code_verifier` plus the original `code_challenge`.
 - Automatic refresh token handling through OpenCode's auth store.
 - Provider and model definitions for current Grok OAuth models.
-- Safety guard that refuses to send OAuth bearer tokens to anything except `https://api.x.ai`.
+- A dedicated `xai-composer` provider for **Cursor Composer 2.5**, served by the Grok Build backend, that reuses your existing Grok token (no second login).
+- Safety guard that refuses to send OAuth bearer tokens to anything except `https://api.x.ai` and `https://cli-chat-proxy.grok.com` (the Grok Build backend).
 
 ## Installation
 
@@ -158,6 +164,70 @@ The fallback list mirrors the Hermes Agent xAI OAuth model list as of this
 implementation. If xAI renames or retires models, update `src/constants.ts` and
 `~/.config/opencode/opencode.json`.
 
+## Composer 2.5 (Grok Build)
+
+**Cursor Composer 2.5** is not served by the public xAI API (`api.x.ai`). It
+lives on the **Grok Build** backend — the same OpenAI-compatible endpoint the
+`grok` CLI uses — at `https://cli-chat-proxy.grok.com/v1`. This plugin exposes
+it through a dedicated provider, **`xai-composer`**.
+
+### Models
+
+| Model ID                 | Backend                       | Use                                              |
+| ------------------------ | ----------------------------- | ------------------------------------------------ |
+| `grok-composer-2.5-fast` | `cli-chat-proxy.grok.com`     | Cursor Composer 2.5 — agentic, multi-file coding. |
+| `grok-build`             | `cli-chat-proxy.grok.com`     | xAI's agentic Grok Build model.                  |
+
+> Note: `grok-build` (Grok Build backend) is a different model from
+> `grok-build-0.1` (public `api.x.ai`).
+
+### How it works
+
+- **Backend routing:** the `xai-composer` provider points at
+  `https://cli-chat-proxy.grok.com/v1`. The host guard allows this origin in
+  addition to `api.x.ai`; the OAuth bearer is still refused everywhere else.
+- **Cluster routing:** requests carry `x-grok-model-override: <model>` (plus
+  `x-grok-client-version` / `x-grok-client-identifier`) so the proxy routes to
+  the correct Composer inference cluster.
+- **No second login:** on first use the provider imports your existing Grok
+  OAuth token from the OpenCode auth store (`xai-oauth`, then `xai`), seeds it
+  under `xai-composer`, and self-manages refresh. A standard
+  `opencode auth login` ("OAuth with xAI Grok") works as a fallback.
+
+### Config
+
+The plugin auto-injects this provider at runtime, but the explicit block keeps
+the model visible and lets you set limits:
+
+```json
+{
+  "provider": {
+    "xai-composer": {
+      "npm": "@ai-sdk/openai",
+      "name": "xAI Grok Composer (OAuth)",
+      "options": {
+        "baseURL": "https://cli-chat-proxy.grok.com/v1"
+      },
+      "models": {
+        "grok-composer-2.5-fast": {
+          "name": "Composer 2.5 Fast (Grok Build)"
+        }
+      }
+    }
+  }
+}
+```
+
+Then select:
+
+```text
+xai-composer/grok-composer-2.5-fast
+```
+
+> Caveat: `cli-chat-proxy.grok.com` is the Grok CLI's private backend
+> (undocumented, may change without notice) and usage counts against your Grok
+> subscription tier.
+
 ## Configuration
 
 ### Plugin Loading
@@ -266,7 +336,7 @@ Test-Path C:\Workspace\01_Coding\Active_Projects\Projetos\opencode-xai-grok-oaut
 - Do not commit `.env`, shell transcripts, callback URLs, access tokens, or refresh tokens.
 - The xAI OAuth client ID is public desktop OAuth metadata, not a secret.
 - Discovered OAuth endpoints are pinned to HTTPS xAI origins.
-- API bearer tokens are blocked from non-`api.x.ai` hosts.
+- API bearer tokens are only sent to `api.x.ai` and `cli-chat-proxy.grok.com` (the Grok Build backend); all other hosts are blocked.
 - On auth failure, re-run `opencode auth login`; do not manually paste tokens into config files.
 
 ## Credits
