@@ -180,7 +180,7 @@ export function createXaiGrokOAuthPlugin(
                 );
               }
 
-              return response;
+              return withStreamIdleTimeout(response);
             },
           };
         },
@@ -1047,4 +1047,33 @@ function browserCommand(url: string): { file: string; args: string[] } | undefin
     return { file: "explorer.exe", args: [url] };
   }
   return { file: "xdg-open", args: [url] };
+}
+
+function withStreamIdleTimeout(response: Response, timeoutMs = 45000): Response {
+  if (!response.body) return response;
+
+  const abortController = new AbortController();
+  let timeoutId: NodeJS.Timeout | undefined;
+
+  const resetTimeout = () => {
+    if (timeoutId) clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => {
+      abortController.abort(new Error(`Stream idle timeout of ${timeoutMs}ms exceeded`));
+    }, timeoutMs);
+  };
+
+  const transform = new TransformStream({
+    start() { resetTimeout(); },
+    transform(chunk, controller) { resetTimeout(); controller.enqueue(chunk); },
+    flush() { if (timeoutId) clearTimeout(timeoutId); }
+  });
+
+  // When the transform stream errors or closes, it will automatically
+  // propagate back to the fetch response body if not consumed anymore,
+  // but we can also manually hook it up if needed.
+  return new Response(response.body.pipeThrough(transform), {
+    status: response.status,
+    statusText: response.statusText,
+    headers: response.headers
+  });
 }
