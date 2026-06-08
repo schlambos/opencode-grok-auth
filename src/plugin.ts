@@ -110,6 +110,16 @@ export function createXaiGrokOAuthPlugin(
 
   const plugin: Plugin = async ({ client }) => {
     return {
+      "experimental.chat.system.transform": async (input: any, output: any) => {
+        // Grok models frequently hallucinate "todo_write" instead of "todowrite".
+        // Inject a targeted reminder to prevent this tool-call failure.
+        const modelStr = typeof input.model === "string" ? input.model : JSON.stringify(input.model || {});
+        if (modelStr.toLowerCase().includes("grok")) {
+          output.system.push(
+            "CRITICAL TOOL NAMING RULE: You must use the exact name `todowrite` (no underscore) for the todo tool. Never use `todo_write`."
+          );
+        }
+      },
       config: async (config) => {
         if (!shouldAutoConfigure()) {
           return;
