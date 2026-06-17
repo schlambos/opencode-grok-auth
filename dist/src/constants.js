@@ -1,5 +1,9 @@
 export const PROVIDER_ID = "xai-oauth";
 export const PROVIDER_NAME = "xAI Grok OAuth";
+export const UNIFIED_PROVIDER_NAME = "xAI Grok";
+// Composer/Build model id prefixes — routed to cli-chat-proxy.grok.com
+// when running in unified (mergeComposerBackend) mode.
+export const COMPOSER_MODEL_PREFIXES = ["grok-composer", "grok-build"];
 export const XAI_API_BASE_URL = "https://api.x.ai/v1";
 export const XAI_OAUTH_ISSUER = "https://auth.x.ai";
 export const XAI_OAUTH_AUTHORIZE_URL = `${XAI_OAUTH_ISSUER}/oauth2/authorize`;

@@ -2,14 +2,18 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { CLI_CHAT_PROXY_BASE_URL, COMPOSER_PROVIDER_ID, COMPOSER_PROVIDER_NAME, DEFAULT_COMPOSER_MODELS, DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_OUTPUT_TOKENS, DEFAULT_XAI_MODELS, GROK_CLIENT_IDENTIFIER, GROK_CLIENT_VERSION, MEDIA_MODEL_DENYLIST_PREFIXES, OAUTH_CALLBACK_TIMEOUT_MS, OPENAI_MODELS_PATH, PROVIDER_ID, PROVIDER_NAME, SAFE_XAI_API_HOSTS, SHARED_OAUTH_AUTH_KEYS, XAI_API_BASE_URL, XAI_DYNAMIC_MODELS_ENV, XAI_LANGUAGE_MODELS_PATH, XAI_MODELS_CACHE_FILE, XAI_MODELS_CACHE_TTL_MS, XAI_MODELS_CACHE_VERSION, XAI_MODELS_FETCH_TIMEOUT_MS, } from "./constants.js";
+import { CLI_CHAT_PROXY_BASE_URL, COMPOSER_MODEL_PREFIXES, COMPOSER_PROVIDER_ID, COMPOSER_PROVIDER_NAME, DEFAULT_COMPOSER_MODELS, DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_OUTPUT_TOKENS, DEFAULT_XAI_MODELS, GROK_CLIENT_IDENTIFIER, GROK_CLIENT_VERSION, MEDIA_MODEL_DENYLIST_PREFIXES, OAUTH_CALLBACK_TIMEOUT_MS, OPENAI_MODELS_PATH, PROVIDER_ID, PROVIDER_NAME, SAFE_XAI_API_HOSTS, SHARED_OAUTH_AUTH_KEYS, UNIFIED_PROVIDER_NAME, XAI_API_BASE_URL, XAI_DYNAMIC_MODELS_ENV, XAI_LANGUAGE_MODELS_PATH, XAI_MODELS_CACHE_FILE, XAI_MODELS_CACHE_TTL_MS, XAI_MODELS_CACHE_VERSION, XAI_MODELS_FETCH_TIMEOUT_MS, } from "./constants.js";
 import { accessTokenExpired, isOAuthAuth, packXaiRefresh, parseXaiRefresh } from "./auth.js";
 import { buildXaiAuthorizeUrl, createOAuthNonce, createOAuthState, discoverXaiOAuth, exchangeXaiCodeForTokens, generatePkce, parseOAuthCallbackInput, refreshXaiTokens, tokenResultToAuthResult, } from "./oauth.js";
 import { startXaiOAuthListener } from "./server.js";
 export function createXaiGrokOAuthPlugin(providerId = PROVIDER_ID, options = {}) {
+    const mergeComposerBackend = options.mergeComposerBackend ?? false;
     const baseURL = options.baseURL ?? XAI_API_BASE_URL;
-    const providerName = options.providerName ?? PROVIDER_NAME;
-    const models = options.models ?? DEFAULT_XAI_MODELS;
+    const providerName = options.providerName ?? (mergeComposerBackend ? UNIFIED_PROVIDER_NAME : PROVIDER_NAME);
+    const defaultModels = mergeComposerBackend
+        ? [...DEFAULT_XAI_MODELS, ...DEFAULT_COMPOSER_MODELS]
+        : DEFAULT_XAI_MODELS;
+    const models = options.models ?? defaultModels;
     const injectModelOverride = options.injectModelOverride ?? false;
     const importTokenFrom = options.importTokenFrom ?? [];
     // Two-provider design:
@@ -20,7 +24,7 @@ export function createXaiGrokOAuthPlugin(providerId = PROVIDER_ID, options = {})
         (baseURL === CLI_CHAT_PROXY_BASE_URL ? OPENAI_MODELS_PATH : XAI_LANGUAGE_MODELS_PATH);
     const modelListKind = options.modelListKind ??
         (baseURL === CLI_CHAT_PROXY_BASE_URL ? "openai-models" : "xai-language-models");
-    const alwaysIncludeModels = options.alwaysIncludeModels ?? [];
+    const alwaysIncludeModels = options.alwaysIncludeModels ?? (mergeComposerBackend ? DEFAULT_COMPOSER_MODELS : []);
     const modelCacheTtlMs = options.modelCacheTtlMs ?? XAI_MODELS_CACHE_TTL_MS;
     const modelFetchTimeoutMs = options.modelFetchTimeoutMs ?? XAI_MODELS_FETCH_TIMEOUT_MS;
     const modelAuthKeys = dedupe([
@@ -62,6 +66,7 @@ export function createXaiGrokOAuthPlugin(providerId = PROVIDER_ID, options = {})
                     modelFetchTimeoutMs,
                     modelAuthKeys,
                     injectGrokClientHeaders: injectModelOverride,
+                    mergeComposerBackend,
                     config,
                 });
                 applyDefaultProviderConfig(config, providerId, {
@@ -90,11 +95,18 @@ export function createXaiGrokOAuthPlugin(providerId = PROVIDER_ID, options = {})
                             if (!isOAuthAuth(latest)) {
                                 return fetch(input, init);
                             }
-                            const modelOverride = injectModelOverride ? extractModelId(init) : undefined;
+                            const modelId = extractModelId(init);
+                            const routeComposer = mergeComposerBackend && isComposerRoutedModel(modelId);
+                            // In unified mode, requests for composer/build models are
+                            // rewritten to the Grok Build proxy host. The model-override
+                            // header tells the proxy which Composer cluster to dispatch to.
+                            const effectiveInput = routeComposer ? rewriteToComposerHost(input) : input;
+                            const modelOverride = routeComposer || injectModelOverride ? modelId : undefined;
+                            const includeGrokClientHeaders = routeComposer || injectModelOverride;
                             const freshAuth = await ensureFreshAuth(latest, client, providerId, tokenSyncKeys);
-                            const request = buildBearerRequest(input, init, freshAuth.access ?? "", {
+                            const request = buildBearerRequest(effectiveInput, init, freshAuth.access ?? "", {
                                 modelOverride,
-                                includeGrokClientHeaders: injectModelOverride,
+                                includeGrokClientHeaders,
                             });
                             const retrySeed = request.clone();
                             let response = await fetch(request);
@@ -102,7 +114,7 @@ export function createXaiGrokOAuthPlugin(providerId = PROVIDER_ID, options = {})
                                 const refreshed = await refreshStoredAuth(freshAuth, client, providerId, tokenSyncKeys);
                                 response = await fetch(buildBearerRequest(retrySeed, undefined, refreshed.access, {
                                     modelOverride,
-                                    includeGrokClientHeaders: injectModelOverride,
+                                    includeGrokClientHeaders,
                                 }));
                             }
                             return withStreamIdleTimeout(response);
@@ -206,6 +218,18 @@ export function createXaiComposerOAuthPlugin(providerId = COMPOSER_PROVIDER_ID) 
     });
 }
 export const XaiComposerOAuthPlugin = createXaiComposerOAuthPlugin();
+/**
+ * Single unified provider that surfaces BOTH Grok models (api.x.ai) and
+ * Composer/Build models (cli-chat-proxy.grok.com) under one entry in
+ * OpenCode's provider list. Routing is per-request, based on model id.
+ */
+export function createXaiUnifiedOAuthPlugin(providerId = PROVIDER_ID) {
+    return createXaiGrokOAuthPlugin(providerId, {
+        mergeComposerBackend: true,
+        importTokenFrom: SHARED_OAUTH_AUTH_KEYS,
+    });
+}
+export const XaiUnifiedOAuthPlugin = createXaiUnifiedOAuthPlugin();
 export function applyDefaultProviderConfig(config, providerId = PROVIDER_ID, opts = {}) {
     if (process.env.OPENCODE_XAI_OAUTH_AUTO_CONFIG === "false") {
         return;
@@ -299,6 +323,42 @@ function buildBearerRequest(input, init, accessToken, opts = {}) {
 export function isSafeXaiApiUrl(url) {
     return (url.protocol === "https:" &&
         SAFE_XAI_API_HOSTS.includes(url.hostname.toLowerCase()));
+}
+function isComposerRoutedModel(modelId) {
+    if (!modelId) {
+        return false;
+    }
+    for (const prefix of COMPOSER_MODEL_PREFIXES) {
+        if (modelId.startsWith(prefix)) {
+            return true;
+        }
+    }
+    return false;
+}
+/**
+ * Replace the host of an outgoing request URL with the Grok Build proxy host,
+ * preserving path, query, headers, and body. Used in unified mode when a
+ * composer/build model is selected.
+ */
+function rewriteToComposerHost(input) {
+    const composerHost = new URL(CLI_CHAT_PROXY_BASE_URL).host;
+    if (typeof input === "string") {
+        const url = new URL(input);
+        url.host = composerHost;
+        url.protocol = "https:";
+        return url.toString();
+    }
+    if (input instanceof URL) {
+        const url = new URL(input.toString());
+        url.host = composerHost;
+        url.protocol = "https:";
+        return url;
+    }
+    // Request
+    const url = new URL(input.url);
+    url.host = composerHost;
+    url.protocol = "https:";
+    return new Request(url.toString(), input);
 }
 /** Extract the `model` field from an outgoing chat-completions request body. */
 function extractModelId(init) {
@@ -556,6 +616,25 @@ async function resolveModelDefaultsForConfig(input) {
             timeoutMs: input.modelFetchTimeoutMs,
             includeGrokClientHeaders: input.injectGrokClientHeaders,
         });
+        if (input.mergeComposerBackend) {
+            // Also pull the Grok Build proxy model list so composer/build models
+            // show up under this single unified provider.
+            const composerFetched = await fetchDynamicModels({
+                baseURL: CLI_CHAT_PROXY_BASE_URL,
+                endpointPath: OPENAI_MODELS_PATH,
+                kind: "openai-models",
+                auth: freshAuth,
+                timeoutMs: input.modelFetchTimeoutMs,
+                includeGrokClientHeaders: true,
+            }).catch(() => []);
+            const seen = new Set(fetched.map((m) => m.id));
+            for (const m of composerFetched) {
+                if (!seen.has(m.id)) {
+                    seen.add(m.id);
+                    fetched.push(m);
+                }
+            }
+        }
         const merged = unionAlwaysInclude(fetched, input.alwaysIncludeModels);
         if (merged.length === 0) {
             throw new Error("Dynamic model list was empty after filtering.");

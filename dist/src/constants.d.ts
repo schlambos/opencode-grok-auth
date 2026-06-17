@@ -1,5 +1,7 @@
 export declare const PROVIDER_ID = "xai-oauth";
 export declare const PROVIDER_NAME = "xAI Grok OAuth";
+export declare const UNIFIED_PROVIDER_NAME = "xAI Grok";
+export declare const COMPOSER_MODEL_PREFIXES: readonly ["grok-composer", "grok-build"];
 export declare const XAI_API_BASE_URL = "https://api.x.ai/v1";
 export declare const XAI_OAUTH_ISSUER = "https://auth.x.ai";
 export declare const XAI_OAUTH_AUTHORIZE_URL = "https://auth.x.ai/oauth2/authorize";

@@ -117,6 +117,14 @@ export interface XaiGrokPluginOptions {
    * `importTokenFrom`.
    */
   modelAuthKeys?: readonly string[];
+  /**
+   * When true, this single provider serves BOTH the public xAI API
+   * (api.x.ai) and the Grok Build proxy (cli-chat-proxy.grok.com). Requests
+   * for composer/build models are routed to the proxy host with
+   * `x-grok-model-override` injected; everything else stays on api.x.ai.
+   * The dynamic model-list fetch merges both endpoints.
+   */
+  mergeComposerBackend?: boolean;
 }
 
 export type XaiTokenExchangeResult =

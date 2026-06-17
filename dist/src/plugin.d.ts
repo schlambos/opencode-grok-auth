@@ -11,6 +11,13 @@ export default XaiGrokOAuthPlugin;
  */
 export declare function createXaiComposerOAuthPlugin(providerId?: string): Plugin;
 export declare const XaiComposerOAuthPlugin: Plugin;
+/**
+ * Single unified provider that surfaces BOTH Grok models (api.x.ai) and
+ * Composer/Build models (cli-chat-proxy.grok.com) under one entry in
+ * OpenCode's provider list. Routing is per-request, based on model id.
+ */
+export declare function createXaiUnifiedOAuthPlugin(providerId?: string): Plugin;
+export declare const XaiUnifiedOAuthPlugin: Plugin;
 export declare function applyDefaultProviderConfig(config: unknown, providerId?: string, opts?: {
     baseURL?: string;
     providerName?: string;
