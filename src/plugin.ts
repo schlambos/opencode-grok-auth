@@ -139,6 +139,13 @@ export function createXaiGrokOAuthPlugin(
           return;
         }
         await syncToNewestSharedAuth(client, providerId, tokenSyncKeys);
+        if (mergeComposerBackend) {
+          // Unified mode supersedes the standalone Composer provider. Strip
+          // its config entry and stale auth.json record so OpenCode stops
+          // surfacing it as a separate provider.
+          removeLegacyProviderConfig(config, COMPOSER_PROVIDER_ID);
+          removeLegacyAuthEntry(COMPOSER_PROVIDER_ID);
+        }
         const modelDefaults = await resolveModelDefaultsForConfig({
           client,
           providerId,
@@ -677,6 +684,47 @@ async function persistAuthBroadcast(
         .catch(() => undefined),
     ),
   );
+}
+
+function removeLegacyProviderConfig(config: unknown, legacyId: string): void {
+  if (!config || typeof config !== "object") {
+    return;
+  }
+  const root = config as Record<string, unknown>;
+  const provider = root.provider as Record<string, unknown> | undefined;
+  if (provider && Object.prototype.hasOwnProperty.call(provider, legacyId)) {
+    delete provider[legacyId];
+  }
+}
+
+/**
+ * Atomically remove `legacyId` from the auth.json store. The opencode SDK
+ * exposes only `auth.set` (no delete), so we edit the file directly with
+ * a temp-file + rename. Best-effort: errors are swallowed.
+ */
+function removeLegacyAuthEntry(legacyId: string): void {
+  try {
+    const file = authStorePath();
+    if (!fs.existsSync(file)) {
+      return;
+    }
+    const raw = fs.readFileSync(file, "utf8");
+    let store: Record<string, unknown>;
+    try {
+      store = JSON.parse(raw) as Record<string, unknown>;
+    } catch {
+      return;
+    }
+    if (!Object.prototype.hasOwnProperty.call(store, legacyId)) {
+      return;
+    }
+    delete store[legacyId];
+    const tempFile = `${file}.${process.pid}.tmp`;
+    fs.writeFileSync(tempFile, JSON.stringify(store, null, 2), "utf8");
+    fs.renameSync(tempFile, file);
+  } catch {
+    // best-effort: never break startup
+  }
 }
 
 function authStorePath(): string {
