@@ -107,6 +107,11 @@ export function createXaiGrokOAuthPlugin(
     ...importTokenFrom,
     ...SHARED_OAUTH_AUTH_KEYS,
   ]);
+  // Keys that should stay in lockstep with this provider's OAuth token.
+  // xAI rotates refresh_token on every refresh, so if we only write back to
+  // our own providerId entry the sibling entries (e.g. xai-composer vs
+  // xai-oauth) instantly hold a revoked refresh token and start failing.
+  const tokenSyncKeys = dedupe([providerId, ...importTokenFrom, ...SHARED_OAUTH_AUTH_KEYS]);
 
   const plugin: Plugin = async ({ client }) => {
     return {
@@ -124,9 +129,7 @@ export function createXaiGrokOAuthPlugin(
         if (!shouldAutoConfigure()) {
           return;
         }
-        if (importTokenFrom.length) {
-          await seedSharedAuth(client, providerId, importTokenFrom);
-        }
+        await syncToNewestSharedAuth(client, providerId, tokenSyncKeys);
         const modelDefaults = await resolveModelDefaultsForConfig({
           client,
           providerId,
@@ -151,7 +154,7 @@ export function createXaiGrokOAuthPlugin(
       auth: {
         provider: providerId,
         async loader(getAuth: GetAuth, provider: Provider): Promise<LoaderResult | Record<string, never>> {
-          const auth = await resolveAuth(getAuth, client, providerId, importTokenFrom);
+          const auth = await resolveAuth(getAuth, client, providerId, importTokenFrom, tokenSyncKeys);
           if (!isOAuthAuth(auth)) {
             return {};
           }
@@ -166,13 +169,13 @@ export function createXaiGrokOAuthPlugin(
             apiKey: auth.access ?? "",
             baseURL,
             async fetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-              const latest = await resolveAuth(getAuth, client, providerId, importTokenFrom);
+              const latest = await resolveAuth(getAuth, client, providerId, importTokenFrom, tokenSyncKeys);
               if (!isOAuthAuth(latest)) {
                 return fetch(input, init);
               }
 
               const modelOverride = injectModelOverride ? extractModelId(init) : undefined;
-              const freshAuth = await ensureFreshAuth(latest, client, providerId);
+              const freshAuth = await ensureFreshAuth(latest, client, providerId, tokenSyncKeys);
               const request = buildBearerRequest(input, init, freshAuth.access ?? "", {
                 modelOverride,
                 includeGrokClientHeaders: injectModelOverride,
@@ -181,7 +184,7 @@ export function createXaiGrokOAuthPlugin(
               let response = await fetch(request);
 
               if (response.status === 401) {
-                const refreshed = await refreshStoredAuth(freshAuth, client, providerId);
+                const refreshed = await refreshStoredAuth(freshAuth, client, providerId, tokenSyncKeys);
                 response = await fetch(
                   buildBearerRequest(retrySeed, undefined, refreshed.access, {
                     modelOverride,
@@ -345,11 +348,12 @@ async function ensureFreshAuth(
   auth: OAuthAuthDetails,
   client: PluginClient | undefined,
   providerId: string,
+  syncKeys: readonly string[],
 ): Promise<OAuthAuthDetails> {
   if (!accessTokenExpired(auth)) {
     return auth;
   }
-  return refreshStoredAuth(auth, client, providerId);
+  return refreshStoredAuth(auth, client, providerId, syncKeys);
 }
 
 /** Reusable token-endpoint refresh: parses the packed refresh, calls the
@@ -383,9 +387,10 @@ async function refreshStoredAuth(
   auth: OAuthAuthDetails,
   client: PluginClient | undefined,
   providerId: string,
+  syncKeys: readonly string[],
 ): Promise<StoredOAuthAuthDetails> {
   const nextAuth = await refreshOAuthAuth(auth);
-  await persistAuth(client, providerId, nextAuth).catch(() => undefined);
+  await persistAuthBroadcast(client, providerId, syncKeys, nextAuth).catch(() => undefined);
   return nextAuth;
 }
 
@@ -453,46 +458,53 @@ function extractModelId(init: RequestInit | undefined): string | undefined {
 }
 
 /**
- * Resolve the OAuth credential for this provider, falling back to an existing
- * Grok token (xai-oauth/xai) when the provider has none of its own. Lets the
- * Composer provider reuse an already-authenticated token without a second login.
+ * Resolve the OAuth credential for this provider. Adopts the newest oauth
+ * entry across the sync-key set so a refresh performed by a sibling provider
+ * (e.g. xai-oauth) immediately propagates to this one. Without this, xAI's
+ * refresh_token rotation revokes the sibling's stale token within ~24h.
  */
 async function resolveAuth(
   getAuth: GetAuth,
   client: PluginClient | undefined,
   providerId: string,
   importTokenFrom: readonly string[],
+  syncKeys: readonly string[],
 ): Promise<AuthDetails> {
   const auth = await getAuth();
-  if (isOAuthAuth(auth) || importTokenFrom.length === 0) {
+  if (syncKeys.length === 0) {
     return auth;
   }
-  const imported = readSharedOAuth(importTokenFrom);
-  if (imported) {
-    await persistAuth(client, providerId, imported).catch(() => undefined);
-    return imported;
+
+  const newest = readNewestSharedOAuth(syncKeys);
+  if (!newest) {
+    return auth;
   }
+
+  if (!isOAuthAuth(auth) || isNewerOAuth(newest, auth)) {
+    await persistAuthBroadcast(client, providerId, syncKeys, newest).catch(() => undefined);
+    return newest;
+  }
+
+  // Our entry is the freshest — push it out so siblings stay in lockstep.
+  await persistAuthBroadcast(client, providerId, syncKeys, {
+    type: "oauth",
+    refresh: auth.refresh,
+    access: auth.access ?? "",
+    expires: typeof auth.expires === "number" ? auth.expires : 0,
+  }).catch(() => undefined);
   return auth;
 }
 
-/** Seed this provider's auth from an existing Grok token if it has none yet. */
-async function seedSharedAuth(
+/** Adopt the newest oauth entry across the sync set into this provider id. */
+async function syncToNewestSharedAuth(
   client: PluginClient | undefined,
   providerId: string,
-  importTokenFrom: readonly string[],
+  syncKeys: readonly string[],
 ): Promise<void> {
   try {
-    const store = readAuthStore();
-    if (!store) {
-      return;
-    }
-    const existing = store[providerId] as { type?: string; access?: string } | undefined;
-    if (existing && existing.type === "oauth" && existing.access) {
-      return; // already authenticated under this provider id
-    }
-    const imported = pickSharedOAuth(store, importTokenFrom);
-    if (imported) {
-      await persistAuth(client, providerId, imported);
+    const newest = readNewestSharedOAuth(syncKeys);
+    if (newest) {
+      await persistAuthBroadcast(client, providerId, syncKeys, newest);
     }
   } catch {
     // best-effort: a missing/locked store should never block startup
@@ -524,18 +536,76 @@ function pickSharedOAuth(
   return undefined;
 }
 
-async function persistAuth(
+/** Return the oauth entry with the highest expires across the sync set. */
+function readNewestSharedOAuth(keys: readonly string[]): StoredOAuthAuthDetails | undefined {
+  const store = readAuthStore();
+  if (!store) {
+    return undefined;
+  }
+  let best: StoredOAuthAuthDetails | undefined;
+  for (const key of keys) {
+    const entry = store[key] as
+      | { type?: string; refresh?: string; access?: string; expires?: number }
+      | undefined;
+    if (!entry || entry.type !== "oauth" || typeof entry.refresh !== "string" || !entry.refresh) {
+      continue;
+    }
+    const candidate: StoredOAuthAuthDetails = {
+      type: "oauth",
+      refresh: entry.refresh,
+      access: typeof entry.access === "string" ? entry.access : "",
+      expires: typeof entry.expires === "number" ? entry.expires : 0,
+    };
+    if (!best || candidate.expires > best.expires) {
+      best = candidate;
+    }
+  }
+  return best;
+}
+
+function isNewerOAuth(a: StoredOAuthAuthDetails, b: OAuthAuthDetails): boolean {
+  const aExp = typeof a.expires === "number" ? a.expires : 0;
+  const bExp = typeof b.expires === "number" ? b.expires : 0;
+  if (aExp !== bExp) {
+    return aExp > bExp;
+  }
+  return a.refresh !== b.refresh;
+}
+
+/**
+ * Persist auth to providerId and to every sync key that already exists as an
+ * oauth entry. Never creates non-oauth entries from scratch, so we won't
+ * clobber an api-key entry under `xai`.
+ */
+async function persistAuthBroadcast(
   client: PluginClient | undefined,
   providerId: string,
+  syncKeys: readonly string[],
   auth: StoredOAuthAuthDetails,
 ): Promise<void> {
   if (!client) {
     return;
   }
-  await client.auth.set({
-    path: { id: providerId },
-    body: { type: "oauth", refresh: auth.refresh, access: auth.access, expires: auth.expires },
-  });
+  const store = readAuthStore();
+  const targets = new Set<string>([providerId]);
+  if (store) {
+    for (const key of syncKeys) {
+      const entry = store[key] as { type?: string } | undefined;
+      if (entry?.type === "oauth") {
+        targets.add(key);
+      }
+    }
+  }
+  await Promise.all(
+    Array.from(targets).map((id) =>
+      client.auth
+        .set({
+          path: { id },
+          body: { type: "oauth", refresh: auth.refresh, access: auth.access, expires: auth.expires },
+        })
+        .catch(() => undefined),
+    ),
+  );
 }
 
 function authStorePath(): string {
@@ -637,7 +707,7 @@ async function resolveConfigOAuthAuth(input: {
   if (!refreshed) {
     return undefined;
   }
-  await persistAuth(input.client, input.providerId, refreshed).catch(() => undefined);
+  await persistAuthBroadcast(input.client, input.providerId, input.authKeys, refreshed).catch(() => undefined);
   return refreshed;
 }
 
@@ -676,7 +746,7 @@ async function resolveModelDefaultsForConfig(
   try {
     // resolveConfigOAuthAuth already returns a non-expired auth (refreshing
     // if needed), so the call below is a defensive re-check.
-    const freshAuth = await ensureFreshAuth(auth, input.client, input.providerId);
+    const freshAuth = await ensureFreshAuth(auth, input.client, input.providerId, input.modelAuthKeys);
     const fetched = await fetchDynamicModels({
       baseURL: input.baseURL,
       endpointPath: input.modelListPath,
