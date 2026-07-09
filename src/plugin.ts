@@ -14,6 +14,7 @@ import {
   DEFAULT_XAI_MODELS,
   GROK_CLIENT_IDENTIFIER,
   GROK_CLIENT_VERSION,
+  KNOWN_XAI_MODEL_LIMITS,
   MEDIA_MODEL_DENYLIST_PREFIXES,
   OAUTH_CALLBACK_TIMEOUT_MS,
   OPENAI_MODELS_PATH,
@@ -376,12 +377,76 @@ export function applyDefaultProviderConfig(
   const models = getOrCreateRecord(provider, "models");
   for (const entry of opts.models ?? DEFAULT_XAI_MODELS) {
     const id = typeof entry === "string" ? entry : entry.id;
-    const value: ProviderModel = typeof entry === "string" ? { name: entry } : entry.model;
+    const value: ProviderModel =
+      typeof entry === "string"
+        ? withKnownLimits(id, { name: prettifyModelId(id) || id })
+        : withKnownLimits(id, entry.model);
     const existing = models[id];
     if (!existing || typeof existing !== "object") {
       models[id] = value;
+      continue;
     }
+    models[id] = withKnownLimits(id, mergeProviderModel(existing as ProviderModel, value));
   }
+}
+
+function withKnownLimits(id: string, model: ProviderModel): ProviderModel {
+  const known = id ? KNOWN_XAI_MODEL_LIMITS[id] : undefined;
+  if (!known) {
+    return model;
+  }
+  const context = model.limit?.context;
+  const output = model.limit?.output;
+  const needsContext = !isPositiveNumber(context) || context === DEFAULT_CONTEXT_WINDOW_TOKENS;
+  const needsOutput = !isPositiveNumber(output) || output === DEFAULT_OUTPUT_TOKENS;
+  if (!needsContext && !needsOutput) {
+    return model;
+  }
+  return {
+    ...model,
+    limit: {
+      context: needsContext ? known.context : (context as number),
+      output: needsOutput ? known.output : (output as number),
+    },
+  };
+}
+
+function mergeProviderModel(existing: ProviderModel, incoming: ProviderModel): ProviderModel {
+  const merged: ProviderModel = { ...existing };
+  if (incoming.name && !existing.name) {
+    merged.name = incoming.name;
+  }
+  const context = pickBetterLimit(existing.limit?.context, incoming.limit?.context);
+  const output = pickBetterLimit(existing.limit?.output, incoming.limit?.output);
+  if (context !== undefined || output !== undefined) {
+    merged.limit = {
+      context: context ?? existing.limit?.context ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
+      output: output ?? existing.limit?.output ?? DEFAULT_OUTPUT_TOKENS,
+    };
+  }
+  return merged;
+}
+
+function pickBetterLimit(existing: unknown, incoming: unknown): number | undefined {
+  const a = isPositiveNumber(existing) ? existing : undefined;
+  const b = isPositiveNumber(incoming) ? incoming : undefined;
+  if (a === undefined) {
+    return b;
+  }
+  if (b === undefined) {
+    return a;
+  }
+  if (a === DEFAULT_CONTEXT_WINDOW_TOKENS && b !== DEFAULT_CONTEXT_WINDOW_TOKENS) {
+    return b;
+  }
+  if (b === DEFAULT_CONTEXT_WINDOW_TOKENS && a !== DEFAULT_CONTEXT_WINDOW_TOKENS) {
+    return a;
+  }
+  return Math.max(a, b);
+}
+
+function isPositiveNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0;
 }
 
 async function ensureFreshAuth(
@@ -862,7 +927,7 @@ async function resolveModelDefaultsForConfig(
     return cache?.models ?? staticDefaults;
   }
 
-  try {
+    try {
     // resolveConfigOAuthAuth already returns a non-expired auth (refreshing
     // if needed), so the call below is a defensive re-check.
     const freshAuth = await ensureFreshAuth(auth, input.client, input.providerId, input.modelAuthKeys);
@@ -874,6 +939,22 @@ async function resolveModelDefaultsForConfig(
       timeoutMs: input.modelFetchTimeoutMs,
       includeGrokClientHeaders: input.injectGrokClientHeaders,
     });
+
+    if (
+      input.baseURL === XAI_API_BASE_URL &&
+      input.modelListPath !== OPENAI_MODELS_PATH
+    ) {
+      const openaiModels = await fetchDynamicModels({
+        baseURL: XAI_API_BASE_URL,
+        endpointPath: OPENAI_MODELS_PATH,
+        kind: "openai-models",
+        auth: freshAuth,
+        timeoutMs: input.modelFetchTimeoutMs,
+        includeGrokClientHeaders: false,
+      }).catch(() => [] as DynamicModelConfig[]);
+      mergeModelLimits(fetched, openaiModels);
+    }
+
     if (input.mergeComposerBackend) {
       // Also pull the Grok Build proxy model list so composer/build models
       // show up under this single unified provider.
@@ -890,9 +971,22 @@ async function resolveModelDefaultsForConfig(
         if (!seen.has(m.id)) {
           seen.add(m.id);
           fetched.push(m);
+        } else {
+          const existing = fetched.find((x) => x.id === m.id);
+          if (existing) {
+            existing.model = withKnownLimits(
+              existing.id,
+              mergeProviderModel(existing.model, withKnownLimits(m.id, m.model)),
+            );
+          }
         }
       }
     }
+
+    for (const entry of fetched) {
+      entry.model = withKnownLimits(entry.id, entry.model);
+    }
+
     const merged = unionAlwaysInclude(fetched, input.alwaysIncludeModels);
     if (merged.length === 0) {
       throw new Error("Dynamic model list was empty after filtering.");
@@ -900,7 +994,12 @@ async function resolveModelDefaultsForConfig(
     writeModelCache(input.providerId, input.baseURL, input.modelListPath, merged);
     return merged;
   } catch {
-    return cache?.models ?? staticDefaults;
+    const fallback = cache?.models ?? staticDefaults;
+    return fallback.map((entry) =>
+      typeof entry === "string"
+        ? entry
+        : { id: entry.id, model: withKnownLimits(entry.id, entry.model ?? { name: entry.id }) },
+    );
   }
 }
 
@@ -1015,21 +1114,31 @@ function buildModelConfig(item: ModelListItem): DynamicModelConfig {
   const id = rawId.trim();
   const nameFromItem = typeof item.name === "string" ? item.name.trim() : "";
   const name = nameFromItem || prettifyModelId(id) || id;
+  const known = KNOWN_XAI_MODEL_LIMITS[id];
+  const context =
+    pickNumericContext(item) ?? known?.context ?? DEFAULT_CONTEXT_WINDOW_TOKENS;
+  const output =
+    pickNumericOutput(item) ?? known?.output ?? DEFAULT_OUTPUT_TOKENS;
   return {
     id,
     model: {
       name,
       cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-      limit: {
-        context: pickNumericContext(item) ?? DEFAULT_CONTEXT_WINDOW_TOKENS,
-        output: pickNumericOutput(item) ?? DEFAULT_OUTPUT_TOKENS,
-      },
+      limit: { context, output },
     },
   };
 }
 
 function pickNumericContext(item: ModelListItem): number | undefined {
-  for (const key of ["context_window", "contextWindow", "max_context_window"] as const) {
+  for (const key of [
+    "context_length",
+    "contextLength",
+    "max_context_length",
+    "max_model_len",
+    "context_window",
+    "contextWindow",
+    "max_context_window",
+  ] as const) {
     const value = item[key];
     if (typeof value === "number" && Number.isFinite(value) && value > 0) {
       return value;
@@ -1039,13 +1148,40 @@ function pickNumericContext(item: ModelListItem): number | undefined {
 }
 
 function pickNumericOutput(item: ModelListItem): number | undefined {
-  for (const key of ["max_output_tokens", "output_token_limit"] as const) {
+  for (const key of [
+    "max_output_tokens",
+    "max_output",
+    "output_token_limit",
+    "output_tokens",
+  ] as const) {
     const value = item[key];
     if (typeof value === "number" && Number.isFinite(value) && value > 0) {
       return value;
     }
   }
   return undefined;
+}
+
+function mergeModelLimits(
+  target: DynamicModelConfig[],
+  source: DynamicModelConfig[],
+): void {
+  if (source.length === 0) {
+    return;
+  }
+  const byId = new Map(source.map((m) => [m.id, m]));
+  for (const entry of target) {
+    const other = byId.get(entry.id);
+    if (!other) {
+      continue;
+    }
+    entry.model = mergeProviderModel(entry.model, other.model);
+  }
+  for (const entry of source) {
+    if (!target.some((m) => m.id === entry.id)) {
+      target.push(entry);
+    }
+  }
 }
 
 /** "grok-4.3" → "Grok 4.3"; "grok-build-0.1" → "Grok Build 0.1";
@@ -1076,16 +1212,25 @@ function unionAlwaysInclude(
   alwaysInclude: readonly string[],
 ): DynamicModelConfig[] {
   if (alwaysInclude.length === 0) {
-    return fetched;
+    return fetched.map((entry) => ({
+      id: entry.id,
+      model: withKnownLimits(entry.id, entry.model),
+    }));
   }
   const seen = new Set(fetched.map((m) => m.id));
-  const out: DynamicModelConfig[] = [...fetched];
+  const out: DynamicModelConfig[] = fetched.map((entry) => ({
+    id: entry.id,
+    model: withKnownLimits(entry.id, entry.model),
+  }));
   for (const id of alwaysInclude) {
     if (!id || seen.has(id)) {
       continue;
     }
     seen.add(id);
-    out.push({ id, model: { name: prettifyModelId(id) || id } });
+    out.push({
+      id,
+      model: withKnownLimits(id, { name: prettifyModelId(id) || id }),
+    });
   }
   return out;
 }
