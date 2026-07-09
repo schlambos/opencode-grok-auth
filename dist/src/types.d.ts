@@ -45,19 +45,24 @@ export interface DynamicModelConfig {
     id: string;
     model: ProviderModel;
 }
-/** Loose shape for items returned by either the xAI or OpenAI-compatible
- *  model-list endpoints. We only care about a handful of fields. */
+/** Loose shape for xAI `/language-models` and OpenAI-compatible `/models` items. */
 export type ModelListItem = Record<string, unknown> & {
     id?: unknown;
     name?: unknown;
     object?: unknown;
     owned_by?: unknown;
     created?: unknown;
+    context_length?: unknown;
+    contextLength?: unknown;
+    max_context_length?: unknown;
+    max_model_len?: unknown;
     context_window?: unknown;
     contextWindow?: unknown;
     max_context_window?: unknown;
     max_output_tokens?: unknown;
+    max_output?: unknown;
     output_token_limit?: unknown;
+    output_tokens?: unknown;
 };
 export interface ModelCacheEntry {
     baseURL: string;
