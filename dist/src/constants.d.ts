@@ -17,12 +17,16 @@ export declare const XAI_LANGUAGE_MODELS_PATH = "/language-models";
 export declare const OPENAI_MODELS_PATH = "/models";
 export declare const XAI_DYNAMIC_MODELS_ENV = "OPENCODE_XAI_DYNAMIC_MODELS";
 export declare const XAI_MODELS_CACHE_FILE = "xai-grok-models-cache.json";
-export declare const XAI_MODELS_CACHE_VERSION = 1;
+export declare const XAI_MODELS_CACHE_VERSION = 2;
 export declare const XAI_MODELS_CACHE_TTL_MS: number;
 export declare const XAI_MODELS_FETCH_TIMEOUT_MS = 3000;
 export declare const DEFAULT_CONTEXT_WINDOW_TOKENS = 131072;
 export declare const DEFAULT_OUTPUT_TOKENS = 8192;
-export declare const DEFAULT_XAI_MODELS: readonly ["grok-4.3", "grok-4.20-0309-reasoning", "grok-4.20-0309-non-reasoning", "grok-4.20-multi-agent-0309"];
+export declare const KNOWN_XAI_MODEL_LIMITS: Readonly<Record<string, {
+    context: number;
+    output: number;
+}>>;
+export declare const DEFAULT_XAI_MODELS: readonly ["grok-4.5", "grok-4.3", "grok-4.20-0309-reasoning", "grok-4.20-0309-non-reasoning", "grok-4.20-multi-agent-0309"];
 export declare const COMPOSER_PROVIDER_ID = "xai-composer";
 export declare const COMPOSER_PROVIDER_NAME = "xAI Grok Composer (OAuth)";
 export declare const CLI_CHAT_PROXY_BASE_URL = "https://cli-chat-proxy.grok.com/v1";

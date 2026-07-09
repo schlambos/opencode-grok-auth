@@ -27,13 +27,28 @@ export const XAI_DYNAMIC_MODELS_ENV = "OPENCODE_XAI_DYNAMIC_MODELS";
 // to the OpenCode auth.json so the loader can survive a temporary network
 // failure on next startup.
 export const XAI_MODELS_CACHE_FILE = "xai-grok-models-cache.json";
-export const XAI_MODELS_CACHE_VERSION = 1;
+// v2 invalidates caches that stored the pre-context_length 131k fallback.
+export const XAI_MODELS_CACHE_VERSION = 2;
 export const XAI_MODELS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 export const XAI_MODELS_FETCH_TIMEOUT_MS = 3000;
-// Sensible defaults used when the upstream model list omits window/output info.
 export const DEFAULT_CONTEXT_WINDOW_TOKENS = 131_072;
 export const DEFAULT_OUTPUT_TOKENS = 8192;
+// Live api.x.ai `/models` context_length values for when list endpoints omit them.
+export const KNOWN_XAI_MODEL_LIMITS = {
+    "grok-4.5": { context: 500_000, output: 500_000 },
+    "grok-4.5-latest": { context: 500_000, output: 500_000 },
+    "grok-build-latest": { context: 500_000, output: 500_000 },
+    "grok-4.3": { context: 1_000_000, output: 30_000 },
+    "grok-4.20-0309-reasoning": { context: 1_000_000, output: 30_000 },
+    "grok-4.20-0309-non-reasoning": { context: 1_000_000, output: 30_000 },
+    "grok-4.20-multi-agent-0309": { context: 1_000_000, output: 30_000 },
+    "grok-build-0.1": { context: 256_000, output: 256_000 },
+    "grok-code-fast-1": { context: 256_000, output: 256_000 },
+    "grok-build": { context: 512_000, output: 8_192 },
+    "grok-composer-2.5-fast": { context: 512_000, output: 8_192 },
+};
 export const DEFAULT_XAI_MODELS = [
+    "grok-4.5",
     "grok-4.3",
     "grok-4.20-0309-reasoning",
     "grok-4.20-0309-non-reasoning",
